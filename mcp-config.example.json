@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "azure-devops": {
+      "command": "node",
+      "args": [
+        "e:\\Coding\\mcp\\azure-devops-mcp-server\\dist\\index.js"
+      ],
+      "env": {
+        "AZURE_DEVOPS_ORG_URL": "https://ericsson-web.visualstudio.com",
+        "AZURE_DEVOPS_TOKEN": "your-azure-devops-personal-access-token-here",
+        "AZURE_DEVOPS_PROJECT": "ericssondotcom-vnext",
+        "AZURE_DEVOPS_USER_EMAIL": "linh.dang.ext@ericsson.com"
+      }
+    }
+  }
+}

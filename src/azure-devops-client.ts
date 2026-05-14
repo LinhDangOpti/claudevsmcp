@@ -1,17 +1,60 @@
 import * as azdev from 'azure-devops-node-api';
 import type { WorkItem } from 'azure-devops-node-api/interfaces/WorkItemTrackingInterfaces.js';
 import type { TeamSettingsIteration } from 'azure-devops-node-api/interfaces/WorkInterfaces.js';
+import type { 
+  GitPullRequest, 
+  GitRepository,
+  FileDiff,
+  GitCommitDiffs
+} from 'azure-devops-node-api/interfaces/GitInterfaces.js';
+import { PullRequestStatus } from 'azure-devops-node-api/interfaces/GitInterfaces.js';
+import { Logger, LogLevel } from './utils/logger.js';
+
+export { LogLevel };
+
+// PR Analysis Interfaces
+export interface PRDetails {
+  pullRequestId: number;
+  repository: string;
+  repositoryId: string;
+  title: string;
+  description: string;
+  sourceRefName: string;
+  targetRefName: string;
+  status: string;
+  createdBy: string;
+  creationDate: Date;
+  closedDate?: Date;
+  url: string;
+}
+
+export interface FileChange {
+  path: string;
+  changeType: 'add' | 'edit' | 'delete' | 'rename';
+  oldPath?: string;
+}
+
+export interface FileDiffDetails {
+  path: string;
+  changeType: 'add' | 'edit' | 'delete' | 'rename';
+  additions: number;
+  deletions: number;
+  diff?: string;
+  oldPath?: string;
+}
 
 export class AzureDevOpsClient {
   private connection: azdev.WebApi;
   private orgUrl: string;
   private project: string;
   private team: string;
+  private logger: Logger;
 
-  constructor(orgUrl: string, token: string, project: string, team: string) {
+  constructor(orgUrl: string, token: string, project: string, team: string, logLevel: LogLevel = LogLevel.INFO) {
     this.orgUrl = orgUrl;
     this.project = project;
     this.team = team;
+    this.logger = new Logger('AzureDevOpsClient', logLevel);
     const authHandler = azdev.getPersonalAccessTokenHandler(token);
     this.connection = new azdev.WebApi(orgUrl, authHandler);
   }
@@ -156,7 +199,7 @@ async getCurrentSprint(): Promise<TeamSettingsIteration | null> {
 
     return null;
   } catch (error) {
-    console.error('Error getting current sprint:', error);
+    this.logger.error('Error getting current sprint:', error);
     return null;
   }
 }
@@ -317,5 +360,320 @@ async getCurrentSprint(): Promise<TeamSettingsIteration | null> {
     }
 
     return storiesWithVerifyTasks;
+  }
+
+  // ============================================
+  // PHASE 1: PR DATA EXTRACTION METHODS
+  // ============================================
+
+  /**
+   * Get all repositories in the project
+   */
+  async getRepositories(): Promise<GitRepository[]> {
+    try {
+      const gitApi = await this.connection.getGitApi();
+      const repositories = await gitApi.getRepositories(this.project);
+      this.logger.info(`Found ${repositories.length} repositories in project ${this.project}`);
+      return repositories;
+    } catch (error) {
+      this.logger.error('Error getting repositories:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get Pull Request details from PR ID and repository
+   * @param repositoryId - Repository ID or name
+   * @param pullRequestId - Pull Request ID
+   */
+  async getPullRequestDetails(repositoryId: string, pullRequestId: number): Promise<PRDetails | null> {
+    try {
+      const gitApi = await this.connection.getGitApi();
+      const pr = await gitApi.getPullRequest(repositoryId, pullRequestId, this.project);
+
+      if (!pr) {
+        this.logger.warn(`Pull Request ${pullRequestId} not found in repository ${repositoryId}`);
+        return null;
+      }
+
+      const details: PRDetails = {
+        pullRequestId: pr.pullRequestId!,
+        repository: pr.repository?.name || repositoryId,
+        repositoryId: pr.repository?.id || repositoryId,
+        title: pr.title || '',
+        description: pr.description || '',
+        sourceRefName: pr.sourceRefName || '',
+        targetRefName: pr.targetRefName || '',
+        status: String(pr.status || ''),
+        createdBy: pr.createdBy?.displayName || '',
+        creationDate: pr.creationDate || new Date(),
+        closedDate: pr.closedDate,
+        url: pr.url || ''
+      };
+
+      this.logger.success(`Retrieved PR #${pullRequestId}: ${details.title}`);
+      return details;
+    } catch (error) {
+      this.logger.error(`Error getting PR details for PR #${pullRequestId}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Get changed files in a Pull Request
+   * @param repositoryId - Repository ID or name
+   * @param pullRequestId - Pull Request ID
+   */
+  async getPullRequestChangedFiles(repositoryId: string, pullRequestId: number): Promise<FileChange[]> {
+    try {
+      const gitApi = await this.connection.getGitApi();
+      
+      // Get PR iterations to find the latest one
+      const iterations = await gitApi.getPullRequestIterations(repositoryId, pullRequestId, this.project);
+      
+      if (!iterations || iterations.length === 0) {
+        this.logger.warn(`No iterations found for PR #${pullRequestId}`);
+        return [];
+      }
+
+      // Get the latest iteration (usually the last one)
+      const latestIteration = iterations[iterations.length - 1];
+      
+      if (!latestIteration.id) {
+        this.logger.warn(`Latest iteration has no ID for PR #${pullRequestId}`);
+        return [];
+      }
+
+      // Get changes from the latest iteration
+      const changes = await gitApi.getPullRequestIterationChanges(
+        repositoryId,
+        pullRequestId,
+        latestIteration.id,
+        this.project
+      );
+
+      const fileChanges: FileChange[] = [];
+
+      if (changes && changes.changeEntries) {
+        for (const change of changes.changeEntries) {
+          const item = change.item;
+          if (!item || item.isFolder) continue;
+
+          const changeType = this.mapChangeType(change.changeType);
+          
+          fileChanges.push({
+            path: item.path || '',
+            changeType,
+            oldPath: change.sourceServerItem
+          });
+        }
+      }
+
+      this.logger.success(`Found ${fileChanges.length} changed files in PR #${pullRequestId}`);
+      return fileChanges;
+    } catch (error) {
+      this.logger.error(`Error getting changed files for PR #${pullRequestId}:`, error);
+      return [];
+    }
+  }
+
+  /**
+   * Get file diffs for a Pull Request with detailed diff content
+   * @param repositoryId - Repository ID or name
+   * @param pullRequestId - Pull Request ID
+   */
+  async getPullRequestFileDiffs(repositoryId: string, pullRequestId: number): Promise<FileDiffDetails[]> {
+    try {
+      const gitApi = await this.connection.getGitApi();
+      
+      // Get PR iterations to find the latest one
+      const iterations = await gitApi.getPullRequestIterations(repositoryId, pullRequestId, this.project);
+      
+      if (!iterations || iterations.length === 0) {
+        this.logger.warn(`No iterations found for PR #${pullRequestId}`);
+        return [];
+      }
+
+      // Get the latest iteration (usually the last one)
+      const latestIteration = iterations[iterations.length - 1];
+      
+      if (!latestIteration.id) {
+        this.logger.warn(`Latest iteration has no ID for PR #${pullRequestId}`);
+        return [];
+      }
+
+      // Get changes from the latest iteration
+      const changes = await gitApi.getPullRequestIterationChanges(
+        repositoryId,
+        pullRequestId,
+        latestIteration.id,
+        this.project
+      );
+
+      const fileDiffs: FileDiffDetails[] = [];
+
+      if (changes && changes.changeEntries) {
+        for (const change of changes.changeEntries) {
+          const item = change.item;
+          if (!item || item.isFolder) continue;
+
+          const changeType = this.mapChangeType(change.changeType);
+          
+          // Get line diff information
+          let additions = 0;
+          let deletions = 0;
+          let diffContent = '';
+          
+          try {
+            // Try to get the actual content for text files
+            if (item.path && !this.isBinaryFile(item.path)) {
+              // Note: Azure DevOps API does not preserve full file content/diffs after PR is merged
+              // We can only show change type and file path
+              try {
+                if (changeType === 'add') {
+                  diffContent = `File added: ${item.path}`;
+                  additions = 1; // Approximate
+                } else if (changeType === 'edit') {
+                  diffContent = `File modified: ${item.path}`;
+                  additions = 1; // Approximate
+                } else if (changeType === 'delete') {
+                  diffContent = `File deleted: ${item.path}`;
+                  deletions = 1;
+                } else if (changeType === 'rename') {
+                  diffContent = `File renamed: ${change.sourceServerItem} → ${item.path}`;
+                }
+              } catch (blobError) {
+                this.logger.warn(`Could not get blob content for ${item.path}:`, blobError);
+                diffContent = `File ${changeType}: ${item.path} (content unavailable)`;
+              }
+            } else {
+              diffContent = `Binary file: ${item.path}`;
+            }
+          } catch (error) {
+            this.logger.warn(`Could not get diff content for ${item.path}:`, error);
+            diffContent = `File changed: ${item.path} (diff unavailable)`;
+          }
+
+          fileDiffs.push({
+            path: item.path || '',
+            changeType,
+            additions,
+            deletions,
+            diff: diffContent || undefined,
+            oldPath: change.sourceServerItem
+          });
+        }
+      }
+
+      this.logger.success(`Retrieved ${fileDiffs.length} file diffs for PR #${pullRequestId}`);
+      return fileDiffs;
+    } catch (error) {
+      this.logger.error(`Error getting file diffs for PR #${pullRequestId}:`, error);
+      return [];
+    }
+  }
+
+  /**
+   * Extract PR information from a work item
+   * Returns array of PR details found in the work item relations
+   */
+  async extractPRsFromWorkItem(workItemId: number): Promise<PRDetails[]> {
+    try {
+      const devLinks = await this.getWorkItemDevelopmentLinks(workItemId);
+      
+      if (!devLinks.hasPullRequests) {
+        this.logger.info(`Work item #${workItemId} has no linked pull requests`);
+        return [];
+      }
+
+      this.logger.debug(`Found ${devLinks.pullRequests.length} PR link(s) in work item #${workItemId}`);
+
+      const prDetails: PRDetails[] = [];
+
+      for (const pr of devLinks.pullRequests) {
+        this.logger.debug(`PR URL: ${pr.url}`);
+        
+        // Parse PR URL to extract repository and PR ID
+        // URL format: vstfs:///Git/PullRequestId/{projectId}%2F{repoId}%2F{prId}
+        try {
+          // Extract the part after /PullRequestId/
+          const match = pr.url.match(/\/PullRequestId\/(.+)$/);
+          if (!match) {
+            this.logger.warn(`Invalid PR URL format: ${pr.url}`);
+            continue;
+          }
+
+          const encodedPath = match[1];
+          this.logger.debug(`Encoded path: ${encodedPath}`);
+          
+          // Decode URL (convert %2F to /)
+          const decodedPath = decodeURIComponent(encodedPath);
+          this.logger.debug(`Decoded path: ${decodedPath}`);
+          
+          // Split by / to get projectId, repoId, prId
+          const parts = decodedPath.split('/');
+          this.logger.debug(`Path parts:`, parts);
+          
+          if (parts.length !== 3) {
+            this.logger.warn(`Expected 3 parts (project/repo/pr), got ${parts.length}: ${pr.url}`);
+            continue;
+          }
+
+          const [projectId, repoId, prId] = parts;
+
+          if (repoId && prId) {
+            this.logger.debug(`Attempting to fetch PR #${prId} from repo ${repoId}`);
+            const details = await this.getPullRequestDetails(repoId, parseInt(prId));
+            if (details) {
+              // Only include completed PRs (status = 3)
+              if (details.status === String(PullRequestStatus.Completed)) {
+                prDetails.push(details);
+                this.logger.debug(`PR #${prId} is completed - added to results`);
+              } else {
+                this.logger.debug(`PR #${prId} status is ${details.status} - skipped (not completed)`);
+              }
+            }
+          } else {
+            this.logger.warn(`Could not parse repo/PR ID from URL: ${pr.url}`);
+          }
+        } catch (error) {
+          this.logger.error(`Error parsing PR URL ${pr.url}:`, error);
+        }
+      }
+
+      this.logger.success(`Extracted ${prDetails.length} completed PRs from work item #${workItemId}`);
+      return prDetails;
+    } catch (error) {
+      this.logger.error(`Error extracting PRs from work item #${workItemId}:`, error);
+      return [];
+    }
+  }
+
+  /**
+   * Helper: Map Azure DevOps change type to simplified type
+   */
+  private mapChangeType(changeType: any): 'add' | 'edit' | 'delete' | 'rename' {
+    // Azure DevOps VersionControlChangeType enum values
+    // 1 = Add, 2 = Edit, 4 = Encoding, 8 = Rename, 16 = Delete, etc.
+    if (changeType & 16) return 'delete';
+    if (changeType & 8) return 'rename';
+    if (changeType & 1) return 'add';
+    return 'edit';
+  }
+
+  /**
+   * Helper: Check if file is binary based on extension
+   */
+  private isBinaryFile(path: string): boolean {
+    const binaryExtensions = [
+      '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.svg',
+      '.pdf', '.zip', '.tar', '.gz', '.rar', '.7z',
+      '.exe', '.dll', '.so', '.dylib',
+      '.mp3', '.mp4', '.avi', '.mov', '.wmv',
+      '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
+    ];
+    
+    const ext = path.substring(path.lastIndexOf('.')).toLowerCase();
+    return binaryExtensions.includes(ext);
   }
 }

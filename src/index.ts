@@ -7,25 +7,10 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import * as dotenv from 'dotenv';
-import * as fs from 'fs';
-import * as path from 'path';
-import { fileURLToPath } from 'url';
-
-dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const cacheFile = path.join(__dirname, '..', 'cache', 'work-items.json');
-
-// Load cache data
-function loadCache() {
-  if (!fs.existsSync(cacheFile)) {
-    throw new Error('Cache file not found. Run "npm run refresh" first.');
-  }
-  const data = fs.readFileSync(cacheFile, 'utf8');
-  return JSON.parse(data);
-}
+import { loadCache } from './utils/cache-manager.js';
+import { logger } from './utils/logger.js';
+import { loadConfig } from './utils/config.js';
+import { AzureDevOpsClient } from './azure-devops-client.js';
 
 // Define tools
 const TOOLS: Tool[] = [
@@ -101,6 +86,74 @@ const TOOLS: Tool[] = [
         }
       },
       required: ['query']
+    }
+  },
+  {
+    name: 'get_work_item_pull_requests',
+    description: 'Get all pull requests linked to a work item by ID',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workItemId: {
+          type: 'number',
+          description: 'Work item ID'
+        }
+      },
+      required: ['workItemId']
+    }
+  },
+  {
+    name: 'get_pull_request_details',
+    description: 'Get detailed information about a specific pull request',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repositoryId: {
+          type: 'string',
+          description: 'Repository ID (GUID)'
+        },
+        pullRequestId: {
+          type: 'number',
+          description: 'Pull request ID'
+        }
+      },
+      required: ['repositoryId', 'pullRequestId']
+    }
+  },
+  {
+    name: 'get_pull_request_files',
+    description: 'Get list of changed files in a pull request',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repositoryId: {
+          type: 'string',
+          description: 'Repository ID (GUID)'
+        },
+        pullRequestId: {
+          type: 'number',
+          description: 'Pull request ID'
+        }
+      },
+      required: ['repositoryId', 'pullRequestId']
+    }
+  },
+  {
+    name: 'get_pull_request_file_diffs',
+    description: 'Get detailed file diffs with additions/deletions for a pull request',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repositoryId: {
+          type: 'string',
+          description: 'Repository ID (GUID)'
+        },
+        pullRequestId: {
+          type: 'number',
+          description: 'Pull request ID'
+        }
+      },
+      required: ['repositoryId', 'pullRequestId']
     }
   }
 ];
@@ -180,11 +233,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const cache = loadCache();
         const id = args.id as number;
         const workItem = cache.workItems.find((wi: any) => wi.id === id);
-        
+
         if (!workItem) {
           throw new Error(`Work item ${id} not found in cache. Run "npm run refresh" to update.`);
         }
-        
+
         return {
           content: [
             {
@@ -192,13 +245,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               text: JSON.stringify({
                 id: workItem.id,
                 title: workItem.title,
+                type: workItem.type,
                 description: workItem.description,
+                reproSteps: workItem.reproSteps,
                 state: workItem.state,
                 assignedTo: workItem.assignedTo,
                 createdDate: workItem.createdDate,
                 changedDate: workItem.changedDate,
                 tags: workItem.tags,
-                comments: workItem.comments
+                comments: workItem.comments,
+                development: workItem.development
               }, null, 2)
             }
           ]
@@ -248,25 +304,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'query_tickets': {
         const cache = loadCache();
         const query = (args.query as string).toLowerCase();
-        
+
         // Parse query for filters
         const states = ['in acc', 'uat approved', 'testing in intg', 'ready for testing', 'active', 'done', 'closed', 'new'];
         const matchedStates = states.filter(s => query.includes(s));
-        
+
         const noCommits = query.includes('no commit') || query.includes('without commit') || query.includes('missing commit');
         const noPRs = query.includes('no pr') || query.includes('no pull request') || query.includes('without pr') || query.includes('missing pr');
         const hasCommits = query.includes('has commit') || query.includes('with commit');
         const hasPRs = query.includes('has pr') || query.includes('has pull request') || query.includes('with pr');
-        
+
         let filtered = cache.workItems;
-        
+
         // Filter by states
         if (matchedStates.length > 0) {
-          filtered = filtered.filter((wi: any) => 
+          filtered = filtered.filter((wi: any) =>
             matchedStates.some(s => wi.state.toLowerCase().includes(s) || s.includes(wi.state.toLowerCase()))
           );
         }
-        
+
         // Filter by commits
         if (noCommits) {
           filtered = filtered.filter((wi: any) => !wi.development?.hasCommits);
@@ -274,7 +330,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (hasCommits) {
           filtered = filtered.filter((wi: any) => wi.development?.hasCommits);
         }
-        
+
         // Filter by PRs
         if (noPRs) {
           filtered = filtered.filter((wi: any) => !wi.development?.hasPullRequests);
@@ -282,16 +338,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (hasPRs) {
           filtered = filtered.filter((wi: any) => wi.development?.hasPullRequests);
         }
-        
+
         // Extract assignee if mentioned
         const assigneeMatch = query.match(/assign(?:ed)?\s+to\s+(\w+)/i);
         if (assigneeMatch) {
           const assignee = assigneeMatch[1];
-          filtered = filtered.filter((wi: any) => 
+          filtered = filtered.filter((wi: any) =>
             wi.assignedTo?.toLowerCase().includes(assignee.toLowerCase())
           );
         }
-        
+
         const results = filtered.map((wi: any) => ({
           id: wi.id,
           title: wi.title,
@@ -301,12 +357,103 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           hasPRs: wi.development?.hasPullRequests || false,
           tags: wi.tags || 'none'
         }));
-        
+
         return {
           content: [
             {
               type: 'text',
               text: `Query: "${args.query}"\nMatched ${results.length} ticket(s)\n\n${JSON.stringify(results, null, 2)}`
+            }
+          ]
+        };
+      }
+
+      case 'get_work_item_pull_requests': {
+        const workItemId = args.workItemId as number;
+        const config = loadConfig();
+        const client = new AzureDevOpsClient(
+          config.orgUrl,
+          config.token,
+          config.project,
+          config.team
+        );
+        const prs = await client.extractPRsFromWorkItem(workItemId);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(prs, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'get_pull_request_details': {
+        const repositoryId = args.repositoryId as string;
+        const pullRequestId = args.pullRequestId as number;
+        const config = loadConfig();
+        const client = new AzureDevOpsClient(
+          config.orgUrl,
+          config.token,
+          config.project,
+          config.team
+        );
+        const details = await client.getPullRequestDetails(repositoryId, pullRequestId);
+
+        if (!details) {
+          throw new Error(`Pull request ${pullRequestId} not found in repository ${repositoryId}`);
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(details, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'get_pull_request_files': {
+        const repositoryId = args.repositoryId as string;
+        const pullRequestId = args.pullRequestId as number;
+        const config = loadConfig();
+        const client = new AzureDevOpsClient(
+          config.orgUrl,
+          config.token,
+          config.project,
+          config.team
+        );
+        const files = await client.getPullRequestChangedFiles(repositoryId, pullRequestId);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(files, null, 2)
+            }
+          ]
+        };
+      }
+
+      case 'get_pull_request_file_diffs': {
+        const repositoryId = args.repositoryId as string;
+        const pullRequestId = args.pullRequestId as number;
+        const config = loadConfig();
+        const client = new AzureDevOpsClient(
+          config.orgUrl,
+          config.token,
+          config.project,
+          config.team
+        );
+        const diffs = await client.getPullRequestFileDiffs(repositoryId, pullRequestId);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(diffs, null, 2)
             }
           ]
         };
@@ -332,10 +479,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('Azure DevOps MCP Server running on stdio');
+  logger.info('Azure DevOps MCP Server running on stdio');
 }
 
 main().catch((error) => {
-  console.error('Fatal error:', error);
+  logger.error('Fatal error:', error);
   process.exit(1);
 });

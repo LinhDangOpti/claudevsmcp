@@ -3,5 +3,9 @@ dist/
 .env
 .DS_Store
 cache/
+pr-analysis/
 *.log
 .vscode/
+.claude/
+.mcp.json
+ericsson-code-base/
