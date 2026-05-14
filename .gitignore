@@ -6,6 +6,7 @@ cache/
 pr-analysis/
 *.log
 .vscode/
-.claude/
+.claude/*
+!.claude/skills/
 .mcp.json
 ericsson-code-base/
