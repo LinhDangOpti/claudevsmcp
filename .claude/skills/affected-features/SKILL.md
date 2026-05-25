@@ -8,28 +8,39 @@ prompt:
 
       1. **Resolve the Input**
          - Check if the user provided an argument after `/affected-features`
-         - If the argument is a pure number (e.g., `14203`), treat it as a ticket number
-         - If it contains slashes or letter-dashes (e.g., `features/Vuong/162/14203-desc`), treat as a branch name
-         - If no argument was given, detect current branch: `git branch --show-current`
+         - Parse optional `--repo-path="path"` parameter for analyzing a different repository
+         - If `--repo-path` is provided, set `REPO_PATH` variable and prefix all git commands with `git -C "{REPO_PATH}"`
+         - If `--repo-path` is NOT provided, `REPO_PATH=""` and use git commands normally
+         - Extract the ticket/branch argument (the non-flag argument):
+           - If the argument is a pure number (e.g., `14203`), treat it as a ticket number
+           - If it contains slashes or letter-dashes (e.g., `features/Vuong/162/14203-desc`), treat as a branch name
+         - If no argument was given, detect current branch: `git -C "{REPO_PATH}" branch --show-current`
+         
+         Example usage:
+         - `/affected-features 14310` — analyze ticket 14310 in current repo
+         - `/affected-features 14310 --repo-path="E:\Coding\dotcom-net5"` — analyze ticket 14310 in dotcom-net5 repo
+         - `/affected-features features/my-branch --repo-path="/path/to/repo"` — analyze specific branch in remote repo
 
       2. **Find the Branch and Changed Files**
 
+         **Important:** If `REPO_PATH` is set, prefix ALL git commands below with `git -C "{REPO_PATH}"` instead of just `git`
+
          **Case A — Ticket number provided:**
-         - Run: `git branch -a --list "*{ticketNumber}*"`
+         - Run: `git -C "{REPO_PATH}" branch -a --list "*{ticketNumber}*"` (or `git branch -a --list "*{ticketNumber}*"` if REPO_PATH is empty)
          - If one or more branches found, prefer the most specific local branch; use `remotes/origin/{branch}` if only remote branches exist
          - If NO branch found, search commit history:
-           `git log --all --oneline --grep="{ticketNumber}" -10`
+           `git -C "{REPO_PATH}" log --all --oneline --grep="{ticketNumber}" -10`
          - If nothing found, report: "No branch or commit found for ticket {ticketNumber}" and stop
 
          **Case B — Branch name provided or current branch detected:**
          - Use the branch name directly
 
          **For any resolved branch — get changed files:**
-         - First try: `git diff origin/main...{branch} --name-only`
+         - First try: `git -C "{REPO_PATH}" diff origin/main...{branch} --name-only`
          - If that returns empty (branch already merged into main), run:
-           `git log origin/main --oneline --grep="{ticketNumber or last-segment-of-branch-name}" -5`
+           `git -C "{REPO_PATH}" log origin/main --oneline --grep="{ticketNumber or last-segment-of-branch-name}" -5`
            to find the merge commit, then:
-           `git diff {mergeCommitHash}^1 {mergeCommitHash} --name-only`
+           `git -C "{REPO_PATH}" diff {mergeCommitHash}^1 {mergeCommitHash} --name-only`
          - If still empty, report: "No file changes detected. The ticket may not exist, not be started, or may have been reverted."
 
          **Multiple branches for the same ticket:**
@@ -195,6 +206,7 @@ prompt:
          ```
          ## Affected Features Report — [Ticket #{number} | Branch: {branch}]
 
+         **Repository:** {REPO_PATH if set, otherwise "Current repository"}
          **Branch:** {branch-name}
          **Status:** [Active branch | Merged into main]
          **Changed files:** {count}
